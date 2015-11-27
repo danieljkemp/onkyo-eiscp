@@ -2,10 +2,10 @@ import re
 import struct
 import time
 import socket, select
-import Queue, threading
+import queue, threading
 from collections import namedtuple
 
-import commands
+from . import commands
 
 
 class ISCPMessage(object):
@@ -32,16 +32,9 @@ class ISCPMessage(object):
     @classmethod
     def parse(self, data):
         EOF = '\x1a'
-        TERMINATORS = ['\n', '\r']
-        assert data[:2] == '!1'
-        eof_offset = -1
-        # EOF can be followed by CR/LF/CR+LF
-        if data[eof_offset] in TERMINATORS:
-          eof_offset -= 1
-          if data[eof_offset] in TERMINATORS:
-            eof_offset -= 1
-        assert data[eof_offset] == EOF
-        return data[2:eof_offset]
+        #assert data[:2] == '!1'
+        #assert data[-1] in [EOF, '\n', '\r']
+        return (data[2:-3]).decode('latin-1')
 
 
 class eISCPPacket(object):
@@ -56,19 +49,23 @@ class eISCPPacket(object):
         iscp_message = str(iscp_message)
         # We attach data separately, because Python's struct module does
         # not support variable length strings,
-        header = struct.pack(
-            '! 4s I I b 3b',
-            'ISCP',             # magic
+        header = bytes('ISCP', "ASCII")
+        header += \
+        struct.pack(
+            '! I I b 3b',
             16,                 # header size (16 bytes)
             len(iscp_message),  # data size
             0x01,               # version
             0x00, 0x00, 0x00    # reserved
         )
 
-        self._bytes = "%s%s" % (header, iscp_message)
+        self._bytes = header + bytes(iscp_message,"ASCII")
         # __new__, string subclass?
 
     def __str__(self):
+        return self._bytes.decode("ASCII")
+        
+    def __bytes__(self):
         return self._bytes
 
     @classmethod
@@ -96,7 +93,7 @@ class eISCPPacket(object):
             struct.unpack('! 4s I I b 3s', bytes)
 
         # Strangly, the header contains a header_size field.
-        assert magic == 'ISCP'
+        assert magic.decode("ASCII") == 'ISCP'
         assert header_size == 16
 
         return eISCPPacket.header(
@@ -107,7 +104,7 @@ def command_to_packet(command):
     """Convert an ascii command like (PVR00) to the binary data we
     need to send to the receiver.
     """
-    return str(eISCPPacket(ISCPMessage(command)))
+    return bytes(eISCPPacket(ISCPMessage(command)))
 
 
 def normalize_command(command):
@@ -202,10 +199,12 @@ def command_to_iscp(command, arguments=None, zone=None):
         # 2. See if we can match a range or pattern
         for possible_arg in commands.VALUE_MAPPINGS[group][prefix]:
             if argument.isdigit():
-                if isinstance(possible_arg, xrange):
+                if isinstance(possible_arg, range):
                     if int(argument) in possible_arg:
                         # We need to send the format "FF", hex() gives us 0xff
-                        value = hex(int(argument))[2:].zfill(2).upper()
+                        value = hex(int(argument))[2:].upper()
+                        if len(value) == 1:
+                            value = "0"+value
                     break
 
             # TODO: patterns not yet supported
@@ -217,7 +216,7 @@ def command_to_iscp(command, arguments=None, zone=None):
 
 
 def iscp_to_command(iscp_message):
-    for zone, zone_cmds in commands.COMMANDS.iteritems():
+    for zone, zone_cmds in commands.COMMANDS.items():
         # For now, ISCP commands are always three characters, which
         # makes this easy.
         command, args = iscp_message[:3], iscp_message[3:]
@@ -226,7 +225,7 @@ def iscp_to_command(iscp_message):
                 return zone_cmds[command]['name'], \
                        zone_cmds[command]['values'][args]['name']
             else:
-                match = re.match('[+-]?[0-9a-f]+$', args, re.IGNORECASE)
+                match = re.match('[+-]?[0-9a-f]$', args, re.IGNORECASE)
                 if match:
                     return zone_cmds[command]['name'], \
                              int(args, 16)
@@ -254,24 +253,9 @@ def filter_for_message(getter_func, msg):
         # however, the interval needed to be at least 200ms before
         # I managed to see any response, and only after 300ms
         # reproducably, so use a generous timeout.
-        if time.time() - start > 5.0:
+        if time.time() - start > 1.5:
             raise ValueError('Timeout waiting for response.')
 
-
-def parse_info(data):
-    response = eISCPPacket.parse(data)
-    # Return string looks something like this:
-    # !1ECNTX-NR609/60128/DX
-    info = re.match(r'''
-        !
-        (?P<device_category>\d)
-        ECN
-        (?P<model_name>[^/]*)/
-        (?P<iscp_port>\d{5})/
-        (?P<area_code>\w{2})/
-        (?P<identifier>.{0,12})
-    ''', response.strip(), re.VERBOSE).groupdict()
-    return info
 
 class eISCP(object):
     """Implements the eISCP interface to Onkyo receivers.
@@ -292,15 +276,15 @@ class eISCP(object):
         in form of a list of dicts.
         """
         onkyo_port = 60128
-        onkyo_magic = str(eISCPPacket('!xECNQSTN'))
+        onkyo_magic = eISCPPacket('!xECNQSTN')
 
         # Broadcast magic
         sock = socket.socket(
             socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.setblocking(0)   # So we can use select()
+        sock.setblocking(False)   # So we can use select()
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.bind(('0.0.0.0', 0))
-        sock.sendto(onkyo_magic, ('255.255.255.255', onkyo_port))
+        sock.sendto(bytes(onkyo_magic), ("<broadcast>", onkyo_port))
 
         found_receivers = []
         while True:
@@ -309,7 +293,18 @@ class eISCP(object):
                 break
             data, addr = sock.recvfrom(1024)
 
-            info = parse_info(data)
+            response = eISCPPacket.parse(data)
+            # Return string looks something like this:
+            # !1ECNTX-NR609/60128/DX
+            info = re.match(r'''
+                !
+                (?P<device_category>\d)
+                ECN
+                (?P<model_name>[^/]*)/
+                (?P<iscp_port>\d{5})/
+                (?P<area_code>\w{2})/
+                (?P<identifier>.{0,12})
+            ''', response.decode("ASCII").strip(), re.VERBOSE).groupdict()
 
             # Give the user a ready-made receiver instance. It will only
             # connect on demand, when actually used.
@@ -323,38 +318,17 @@ class eISCP(object):
     def __init__(self, host, port=60128):
         self.host = host
         self.port = port
-        self._info = None
 
         self.command_socket = None
 
     def __repr__(self):
-        if self.info and self.info.get('model_name'):
+        if getattr(self, 'info', False) and self.info.get('model_name'):
             model = self.info['model_name']
         else:
             model = 'unknown'
         string = "<%s(%s) %s:%s>" % (
             self.__class__.__name__, model, self.host, self.port)
         return string
-
-    @property
-    def info(self):
-        if not self._info:
-            sock = socket.socket(
-                socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-            sock.setblocking(0)
-            sock.bind(('0.0.0.0', 0))
-            sock.sendto(str(eISCPPacket('!xECNQSTN')), (self.host, self.port))
-
-            ready = select.select([sock], [], [], 0.1)
-            if ready[0]:
-                data = sock.recv(1024)
-                self._info = parse_info(data)
-            sock.close()
-        return self._info
-
-    @info.setter
-    def info(self, value):
-        self._info = value
 
     def _ensure_socket_connected(self):
         if self.command_socket is None:
@@ -422,25 +396,25 @@ class eISCP(object):
         self.send(iscp_message)
         return filter_for_message(self.get, iscp_message)
 
-    def command(self, command, arguments=None, zone=None):
+    def command(self, command, arguments=None, zone=None, wait_for_response=True):
         """Send a high-level command to the receiver, return the
         receiver's response formatted has a command.
 
         This is basically a helper that combines :meth:`raw`,
         :func:`command_to_iscp` and :func:`iscp_to_command`.
         """
-        iscp_message = command_to_iscp(command, arguments, zone)
-        response = self.raw(iscp_message)
+        iscp_message = command_to_iscp(command)
+        response = self.raw(iscp_message, wait_for_response)
         if response:
             return iscp_to_command(response)
 
     def power_on(self):
         """Turn the receiver power on."""
-        return self.command('power', 'on')
+        return self.command('system-power on')
 
     def power_off(self):
         """Turn the receiver power off."""
-        return self.command('power', 'off')
+        return self.command('system-power standby')
 
 
 class Receiver(eISCP):
@@ -455,8 +429,12 @@ class Receiver(eISCP):
         receiver = Receiver('...')
         receiver.on_message = message_received
 
-    The argument ``message`` is
+    The argument `message` is
     """
+
+    def __init__(self, addr, port):
+        self.on_message = None
+        super().__init__(addr, port)
 
     @classmethod
     def discover(cls, timeout=5, clazz=None):
@@ -465,7 +443,7 @@ class Receiver(eISCP):
     def _ensure_thread_running(self):
         if not getattr(self, '_thread', False):
             self._stop = False
-            self._queue = Queue.Queue()
+            self._queue = queue.Queue()
             self._thread = threading.Thread(target=self._thread_loop)
             self._thread.start()
 
@@ -487,14 +465,22 @@ class Receiver(eISCP):
         """
         raise NotImplementedError()
 
-    def raw(self, iscp_message):
+    def raw(self, iscp_message, wait=True):
         """Like :meth:`eISCP.raw`.
         """
         self._ensure_thread_running()
-        event = threading.Event()
+
+        event=None
+        if wait:
+            event = threading.Event()
+
         result = []
+
         self._queue.put((iscp_message, event, result))
-        event.wait()
+        if event:
+            event.wait()
+        else:
+            return
         if isinstance(result[0], Exception):
             raise result[0]
         return result[0]
@@ -502,7 +488,7 @@ class Receiver(eISCP):
     def _thread_loop(self):
         def trigger(message):
             if self.on_message:
-                self.on_message(message)
+                self.on_message(iscp_to_command(message))
 
         eISCP._ensure_socket_connected(self)
         try:
@@ -517,7 +503,7 @@ class Receiver(eISCP):
                 # Send next message
                 try:
                     item = self._queue.get(timeout=0.01)
-                except Queue.Empty:
+                except queue.Empty:
                     continue
                 if item:
                     message, event, result = item
@@ -533,7 +519,7 @@ class Receiver(eISCP):
                             # to get() them. Maybe use a queue after all.
                             response = filter_for_message(
                                 super(Receiver, self).get, message)
-                        except ValueError, e:
+                        except ValueError as e:
                             # No response received within timeout
                             result.append(e)
                         else:
