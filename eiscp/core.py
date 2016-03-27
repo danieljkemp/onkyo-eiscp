@@ -404,7 +404,7 @@ class eISCP(object):
         :func:`command_to_iscp` and :func:`iscp_to_command`.
         """
         iscp_message = command_to_iscp(command)
-        response = self.raw(iscp_message, wait_for_response)
+        response = self.raw(iscp_message)
         if response:
             return iscp_to_command(response)
 
